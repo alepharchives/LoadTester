@@ -157,6 +157,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 
 parse_config([], State) ->
+    lager:notice("Configuration parsed: ~p",[State]),
     State;
 parse_config([{ramp_time_ms, T} |Rest], State) when is_integer(T), T > 0 ->
     parse_config(Rest, State#state{ramp_time_ms=T});
@@ -165,7 +166,7 @@ parse_config([{get, Url, Headers, Action, N, Limit}|Rest],#state{load_specs=Ls}=
 		   _ when is_function(Action) -> 
 		       Action;
 		   _Else -> 
-		       fun(AUrl,AResp) -> {AUrl, AResp} end
+		       fun(AUrl, AReg, _AResp) -> {AUrl, AReg} end
 	       end,
     SpecList = [#load_spec{type=get,
 			   url=Url,
@@ -179,6 +180,7 @@ parse_config([_|Rst], State) ->
 
 
 start_test(#state{ramp_time_ms=Stagger, load_specs=Jobs})->
+    lager:notice("Beginning to spawn workers"),
     F = fun(#load_spec{n_procs=N}, Acc) -> Acc + N end,
     NJobs = lists:foldl(F, 0, Jobs),
     EachWait = erlang:round(Stagger/NJobs),
