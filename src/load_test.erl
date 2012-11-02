@@ -13,26 +13,21 @@
 -behaviour(gen_server).
 
 %% Module API
--export([start_link/0, set_state/1, start_test/0]).
+-export([start_link/0, set_state/1, start_test/0, stop_test/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
--define(SERVER, ?MODULE). 
--record(load_spec, {
-	  type=get     :: get|put,
-	  url          :: string(),
-	  http_headers :: [tuple()],
-	  action_fn    :: function(),
-	  n_procs      :: pos_integer(),
-	  limit        :: pos_integer()
-	 }).
--type load_spec() :: #load_spec{}.
 
+-include("../include/records.hrl").
+-type load_spec()     :: #job{}.
+
+-define(SERVER, ?MODULE). 
 
 -record(state, {ramp_time_ms=30 :: pos_integer(),
-		load_specs=[]   ::[load_spec()]}).
+		load_specs=[]   ::[load_spec()],
+		pids=[]}).
 
 %%%===================================================================
 %%% API
@@ -45,6 +40,9 @@ set_state(_) ->
 
 start_test()->
     gen_server:call(?MODULE, start_test).
+
+stop_test()->
+        gen_server:cast(?MODULE, stop_test).
     
 %%--------------------------------------------------------------------
 %% @doc
@@ -72,6 +70,7 @@ start_link() ->
 %% @end
 %%--------------------------------------------------------------------
 init([]) ->
+    process_flag(trap_exit, true), 
     {ok, #state{}}.
 
 %%--------------------------------------------------------------------
@@ -89,8 +88,9 @@ init([]) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_call(start_test, _From, State) ->
-    start_test(State),
-    {reply, ok, State};
+    NewState = start_test(State),
+    {reply, ok, NewState};
+
 handle_call({parse_config, PropList}, _From, State) ->
     NewState = parse_config(PropList, State),
     lager:notice("New State ~p~n",[NewState]),
@@ -110,6 +110,9 @@ handle_call(_Request, _From, State) ->
 %%                                  {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
+handle_cast(stop_test, State) ->
+    stop_test(State),
+    {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -123,6 +126,11 @@ handle_cast(_Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
+handle_info({'DOWN', MonitorRef, _Type, _Object, _Info}, #state{pids=Pids}=S) ->
+    NewPids = lists:keydelete(MonitorRef, 2, Pids),
+    {noreply, S#state{pids=NewPids}};
+
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -161,44 +169,45 @@ parse_config([], State) ->
     State;
 parse_config([{ramp_time_ms, T} |Rest], State) when is_integer(T), T > 0 ->
     parse_config(Rest, State#state{ramp_time_ms=T});
-parse_config([{get, Url, Headers, Action, N, Limit}|Rest],#state{load_specs=Ls}=State) ->
+parse_config([{get, Name, N, Url, Headers, Action, Limit, Delay}|Rest], #state{load_specs=Ls}=State) ->
     ActionFn = case Action of
 		   _ when is_function(Action) -> 
 		       Action;
 		   _Else -> 
 		       fun(AUrl, AReg, _AResp) -> {AUrl, AReg} end
 	       end,
-    SpecList = [#load_spec{type=get,
-			   url=Url,
-			   http_headers=Headers,
-			   action_fn=ActionFn,
-			   n_procs = N,
-			  limit=Limit} | Ls],
-    parse_config(Rest,State#state{load_specs=SpecList});
+    NewJob = #job{type=get, name=Name, n_procs=N, url=Url, headers=Headers, 
+		  action_fn=ActionFn, limit=Limit, delay_ms=Delay},
+
+    NewSpecs = [NewJob|lists:keydelete(Name, #job.name, Ls)],
+    parse_config(Rest, State#state{load_specs=NewSpecs});
 parse_config([_|Rst], State) ->
     parse_config(Rst, State).
 
 
-start_test(#state{ramp_time_ms=Stagger, load_specs=Jobs})->
+start_test(#state{ramp_time_ms=Stagger, load_specs=Jobs, pids=Pids})->
     lager:notice("Beginning to spawn workers"),
-    F = fun(#load_spec{n_procs=N}, Acc) -> Acc + N end,
+    F = fun(#job{n_procs=N}, Acc) -> Acc + N end,
     NJobs = lists:foldl(F, 0, Jobs),
     EachWait = erlang:round(Stagger/NJobs),
     
-    start_workers(Jobs, EachWait, EachWait).
+    NewPids = start_workers(Jobs, EachWait, EachWait, Pids),
+    #state{pids=NewPids}.
 
-start_workers([], _Wait, _WaitIncr) ->
-    lager:notice("Done spawing workers");
-start_workers([#load_spec{type=get, n_procs=N}=Job|Rest], Wait, WaitIncr)->
+start_workers([], _Wait, _WaitIncr, Pids) ->
+    lager:notice("Done spawing workers"),
+    Pids;
+start_workers([#job{type=get, n_procs=N}=Job|Rest], Wait, WaitIncr, Pids)->
     Limit = Wait + (N-1) * WaitIncr,
-    [spawn(get_worker, start, [[Job#load_spec.url, 
-			       Job#load_spec.http_headers,
-			       Job#load_spec.limit,
-			       Job#load_spec.action_fn,
-			       W]]) || W <- lists:seq(Wait, Limit, WaitIncr)],
-    start_workers(Rest, Limit+WaitIncr, WaitIncr).
+    NewPids = [spawn_monitor(get_worker, start, [Job, W]) || 
+		  W <- lists:seq(Wait, Limit, WaitIncr)],
+    start_workers(Rest, Limit+WaitIncr, WaitIncr, NewPids ++ Pids).
 
 
-    
+stop_test(#state{pids=Pids})->
+    lager:notice("Attmepting to stop workers"),
+    [(Pid ! stop) || {Pid,_} <- Pids],
+    lager:notice("Attmepting to stop workers"),
+    ok.
 
 
