@@ -14,36 +14,38 @@
 -include("../include/records.hrl").
 
 %% API
--export([start/2]).
+-export([start/3]).
 
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-start(Job, Wait) ->
+start(Job, Wait, Tid) ->
     inets:start(),
     lager:notice("Get workder[~p] starting, will wait: ~p",[self(), Wait]),
     timer:sleep(Wait),
     lager:notice("Get worker [~p] awake",[self()]),
-    loop(Job).
+    loop(Job, Tid).
 
 
-loop(#job{count=Count, limit=Limit}=State)->
+loop(#job{count=Count, limit=Limit}=State, Tid)->
     case Count > (Limit-1) of
-	true ->	stop(State);
+	true ->	stop(State, Tid);
 	false ->
 	    receive
 		stop ->
-		    stop(State)
+		    stop(State, Tid)
 	    after
 		0 ->
-		    work(State)
+		    work(State, Tid)
 	    end
     end.
 
-work(#job{url=Url, 
-	  headers=_Headers, 
+work(#job{type=T,
+	  name=N,
+	  url=Url, 
+	  headers=Headers, 
 	  last_response=LastResp, 
 	  register=Register,
 	  delay_ms=Delay,
@@ -51,16 +53,20 @@ work(#job{url=Url,
 	  count=Count, 
 	  min=Min, 
 	  max=Max, 
-	  total_time=TotalTime}=State) ->
+	  total_time=TotalTime}=State, Tid) ->
     
-    {NewUrl, NewRegister} = Fn(Url, Register, LastResp),
-    {TimeMs, {ok,{{"HTTP/1.1",200,"OK"},[_, _, _, _], _}}=Resp} = 
-	timer:tc(fun()->httpc:request(get, {NewUrl, []},[],[]) end),
+    {NewUrl, NewRegister} = do_action(Fn, Url, Register, LastResp),
+    
+    {TimeMs, 
+     {ok,{{"HTTP/1.1",200,"OK"},[_, _, _, _], _}}=Resp} = 
+	timer:tc(fun()->httpc:request(get, {NewUrl, Headers},[],[]) end),
+
     Time = TimeMs/1000000,
     NewMin=min(Min, Time), 
     NewMax=max(Max,Time),
     NewCount = Count + 1,
     NewTotalTime = TotalTime + Time,
+    ets:insert(Tid, {self(), T, N, NewMin, NewMax, NewCount, NewTotalTime}),
     timer:sleep(Delay),
     loop(State#job{url=NewUrl, 
 		   last_response=Resp, 
@@ -68,11 +74,19 @@ work(#job{url=Url,
 		   count=NewCount, 
 		   min=NewMin, 
 		   max=NewMax, 
-		   total_time=NewTotalTime}).
+		   total_time=NewTotalTime}, Tid).
 
-stop(#job{min=Min, max=Max, count=Count, total_time=TotalTime})->
-    Avg = TotalTime/Count,
-    io:format("~nGet worker [~p] finished: min: ~p, max: ~p, avg: ~p count: ~p~n",
-	      [self(), Min, Max, Avg, Count]).
+stop(#job{type=T, name=N, min=Min, max=Max, count=Count, total_time=TotalTime}, Tid)->
+    Avg = case Count > 0 of true ->TotalTime/Count; false -> 0 end,
+    io:format("~nGet worker [~p] finished: min: ~.3f, max: ~.3f, avg: ~.3f count: ~p~n",
+	      [self(), Min, Max, Avg, Count]),
+    ets:insert(Tid, {self(), T, N, Min, Max, Count, TotalTime}).
     
     
+do_action(Fn, Url, Register, LastResp) ->
+    case Fn of
+	none ->
+	    {Url, Register};
+	_ when is_function(Fn) ->
+	    Fn(Url, Register, LastResp)
+    end.
